@@ -5,7 +5,7 @@ import com.datastore.server.TcpServer;
 import java.io.IOException;
 
 /**
- * Application entry point. Starts the Phase 1 TCP server on the Redis default port.
+ * Application entry point. Starts the TCP server on the Redis default port.
  */
 public final class Main {
 
