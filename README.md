@@ -5,7 +5,7 @@
 ![Protocol](https://img.shields.io/badge/Protocol-RESP-blue.svg)
 ![TCP](https://img.shields.io/badge/Transport-TCP%2FIP-informational.svg)
 ![Concurrency](https://img.shields.io/badge/Concurrency-Thread%20Pool-success.svg)
-![Status](https://img.shields.io/badge/Phase-1%20Core%20Server-yellow.svg)
+![Status](https://img.shields.io/badge/Phase-2%20RESP%20%2B%20Commands-yellow.svg)
 
 A high-performance, multithreaded, Redis-compatible in-memory data store built from scratch in Java.
 
@@ -65,7 +65,9 @@ Persistence              Replication
 (RDB / AOF)            (Primary → Replica)
 ```
 
-Phase 1 implements the TCP socket layer: a `ServerSocket` accept loop, a bounded `ExecutorService` thread pool, and a per-connection `ClientHandler` that echoes a dummy RESP simple-string reply (`+OK\r\n`) until the parser and router land in later phases.
+Phase 1 implemented the TCP socket layer: a `ServerSocket` accept loop, a bounded `ExecutorService` thread pool, and a per-connection `ClientHandler`.
+
+Phase 2 wires that handler to a RESP parser, a command registry (`CommandRouter`), and the first Redis-compatible commands (`PING`, `ECHO`). Replies are serialized back to RESP. The shared store is still ahead; unknown commands return a RESP error.
 
 Architectural rationale lives in [`docs/architecture.md`](docs/architecture.md).
 
@@ -75,11 +77,12 @@ Architectural rationale lives in [`docs/architecture.md`](docs/architecture.md).
 
 | Phase | Focus | Status |
 | :---: | --- | --- |
-| **1** | **Core Server** — multithreaded TCP listener on port `6379`, connection lifecycle, dummy RESP replies | In progress |
-| **2** | **Advanced Data Structures** — strings, lists, hashes, sets, sorted sets, and (later) streams behind a command router | Planned |
-| **3** | **Concurrency / Transactions** — shared-state protection, `MULTI`/`EXEC`, `WATCH`, isolation under concurrent clients | Planned |
-| **4** | **Persistence** — RDB snapshots and AOF logging for crash recovery | Planned |
-| **5** | **Replication** — primary → replica sync, replica catch-up, and failover behavior | Planned |
+| **1** | **Core Server** — multithreaded TCP listener on port `6379`, connection lifecycle | Complete |
+| **2** | **RESP Protocol + Basic Commands** — array/bulk-string parser, serializer, Command pattern, `PING` / `ECHO` | In progress |
+| **3** | **Advanced Data Structures** — strings, lists, hashes, sets, sorted sets, and (later) streams behind the command router | Planned |
+| **4** | **Concurrency / Transactions** — shared-state protection, `MULTI`/`EXEC`, `WATCH`, isolation under concurrent clients | Planned |
+| **5** | **Persistence** — RDB snapshots and AOF logging for crash recovery | Planned |
+| **6** | **Replication** — primary → replica sync, replica catch-up, and failover behavior | Planned |
 
 ---
 
@@ -91,7 +94,7 @@ RESP is a small, binary-safe, request/response protocol. Implementing it means:
 - **Testability** — protocol correctness can be verified with tools the ecosystem already trusts.
 - **Discipline** — the parser is a first-class component, not an afterthought bolted onto a text line reader.
 
-Until the parser ships, Phase 1 still writes `+OK\r\n` so a TCP client (including `redis-cli`) receives a well-formed simple string.
+The parser accepts RESP **arrays of bulk strings** (what `redis-cli` sends). Closed or malformed frames end the connection loop rather than leaving the handler in an undefined state.
 
 ---
 
@@ -121,13 +124,29 @@ The server binds **port 6379** (the Redis default) and logs accepted connections
 
 ### Talk to the server
 
-```bash
-# Any TCP client
-printf 'PING\r\n' | nc 127.0.0.1 6379
+`redis-cli` encodes commands as RESP arrays, which is what this parser implements:
 
-# redis-cli (works today for a dummy +OK; full command semantics arrive with the RESP parser)
+```bash
 redis-cli -p 6379 PING
+# PONG
+
+redis-cli -p 6379 PING hello
+# "hello"
+
+redis-cli -p 6379 ECHO hello
+# "hello"
+
+redis-cli -p 6379 ECHO
+# (error) ERR wrong number of arguments for 'echo' command
 ```
+
+Raw TCP (RESP array for `PING`):
+
+```bash
+printf '*1\r\n$4\r\nPING\r\n' | nc 127.0.0.1 6379
+```
+
+Inline Redis text (`PING\r\n` with no `*` array) is not parsed yet; use `redis-cli` or a full RESP array.
 
 ---
 
@@ -141,6 +160,14 @@ distributed-in-memory-datastore/
 │   └── architecture.md
 └── src/main/java/com/datastore/
     ├── Main.java
+    ├── protocol/
+    │   ├── RespParser.java
+    │   └── RespSerializer.java
+    ├── command/
+    │   ├── Command.java
+    │   ├── CommandRouter.java
+    │   ├── PingCommand.java
+    │   └── EchoCommand.java
     └── server/
         ├── TcpServer.java
         └── ClientHandler.java
@@ -149,15 +176,22 @@ distributed-in-memory-datastore/
 | Type | Path | Role |
 | --- | --- | --- |
 | Entry point | `com.datastore.Main` | Binds port 6379, registers a shutdown hook, starts the server |
-| Accept loop | `com.datastore.server.TcpServer` | `ServerSocket` + `ExecutorService` (fixed pool of 10) |
-| Connection | `com.datastore.server.ClientHandler` | Reads bytes, logs payload, writes `+OK\r\n` |
+| Accept loop | `com.datastore.server.TcpServer` | `ServerSocket` + `ExecutorService` (fixed pool of 10); shared `CommandRouter` |
+| Connection | `com.datastore.server.ClientHandler` | Parse RESP → route → write serialized reply |
+| Parser | `com.datastore.protocol.RespParser` | Reads `*` arrays of `$` bulk strings from a `BufferedReader` |
+| Serializer | `com.datastore.protocol.RespSerializer` | Simple strings, bulk strings (including null `$-1`), errors |
+| Router | `com.datastore.command.CommandRouter` | Case-insensitive registry; unknown commands return a RESP error |
+| Commands | `PingCommand`, `EchoCommand` | Redis-compatible `PING` / `ECHO` |
 
 ---
 
-## Design constraints (Phase 1)
+## Design constraints (Phase 1–2)
 
 - **Thread pool, not unbounded thread-per-connection.** `Executors.newFixedThreadPool(10)` caps OS threads and keeps the accept path from collapsing under a connection flood. See architecture Q1.
-- **RESP-shaped I/O from day one.** Dummy replies use CRLF-terminated simple strings so later parser work does not change the socket layer.
+- **Parse and serialize at the edge.** `ClientHandler` does not interpret command names; it only frames I/O. Semantics live in `Command` implementations.
+- **Command pattern for dispatch.** New verbs register in `CommandRouter` without changing the accept loop or the parser.
+- **Shared, stateless router.** `PING` and `ECHO` have no mutable state, so one `CommandRouter` is reused across worker threads.
+- **Graceful disconnect.** An empty or null parse result (EOF / incomplete frame) breaks the handler loop.
 - **Graceful shutdown.** Closing the `ServerSocket` unblocks `accept()`; the pool is shut down afterward.
 
 ---

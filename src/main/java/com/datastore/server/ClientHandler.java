@@ -1,27 +1,31 @@
 package com.datastore.server;
 
+import com.datastore.command.CommandRouter;
+import com.datastore.protocol.RespParser;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 /**
- * Handles a single client TCP connection on a worker thread from {@link TcpServer}'s pool.
- *
- * <p>Phase 1 does not parse RESP yet. Incoming bytes are logged and a dummy simple-string
- * reply {@code +OK\r\n} is written so clients (including {@code redis-cli}) receive a
- * well-formed RESP response.
+ * Handles a single client TCP connection: parse RESP, route the command, write the reply.
  */
 public class ClientHandler implements Runnable {
 
-    private static final int BUFFER_SIZE = 4096;
-    private static final byte[] DUMMY_OK_RESPONSE = "+OK\r\n".getBytes(StandardCharsets.UTF_8);
-
     private final Socket socket;
+    private final CommandRouter commandRouter;
+    private final RespParser respParser;
 
-    public ClientHandler(Socket socket) {
+    public ClientHandler(Socket socket, CommandRouter commandRouter) {
         this.socket = socket;
+        this.commandRouter = commandRouter;
+        this.respParser = new RespParser();
     }
 
     @Override
@@ -32,16 +36,19 @@ public class ClientHandler implements Runnable {
 
         try (Socket clientSocket = socket;
              InputStream in = clientSocket.getInputStream();
-             OutputStream out = clientSocket.getOutputStream()) {
+             OutputStream out = clientSocket.getOutputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(out))) {
 
-            byte[] buffer = new byte[BUFFER_SIZE];
-            int bytesRead;
-            while ((bytesRead = in.read(buffer)) != -1) {
-                String received = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
-                System.out.println("[client " + remote + "] " + received);
+            while (true) {
+                List<String> request = respParser.parse(reader);
+                if (request == null || request.isEmpty()) {
+                    break;
+                }
 
-                out.write(DUMMY_OK_RESPONSE);
-                out.flush();
+                String response = commandRouter.route(request);
+                writer.write(response);
+                writer.flush();
             }
         } catch (IOException e) {
             System.err.println("I/O error on connection " + remote + ": " + e.getMessage());

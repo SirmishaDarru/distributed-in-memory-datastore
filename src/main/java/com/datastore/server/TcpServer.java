@@ -1,5 +1,7 @@
 package com.datastore.server;
 
+import com.datastore.command.CommandRouter;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -20,6 +22,7 @@ public class TcpServer {
 
     private final int port;
     private final ExecutorService workerPool;
+    private final CommandRouter commandRouter;
 
     private volatile boolean running;
     private ServerSocket serverSocket;
@@ -27,6 +30,7 @@ public class TcpServer {
     public TcpServer(int port) {
         this.port = port;
         this.workerPool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
+        this.commandRouter = new CommandRouter();
     }
 
     /**
@@ -46,7 +50,7 @@ public class TcpServer {
             try {
                 Socket client = serverSocket.accept();
                 System.out.println("Accepted connection from " + client.getRemoteSocketAddress());
-                workerPool.submit(new ClientHandler(client));
+                workerPool.submit(new ClientHandler(client, commandRouter));
             } catch (SocketException e) {
                 if (!running) {
                     break;
